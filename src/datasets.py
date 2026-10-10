@@ -288,7 +288,6 @@ def get_subject_split(seed: int = RANDOM_SEED) -> dict:
     manifest = generate_subject_split(seed)
 
     validate_subject_split(manifest)
-
     save_subject_split(manifest)
 
     return manifest

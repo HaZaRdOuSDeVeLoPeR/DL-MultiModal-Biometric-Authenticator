@@ -75,6 +75,7 @@ def _filter_data(data: dict, subjects: Iterable[int]) -> dict:
 def _merge_embedding_data(chunks: list[dict]) -> dict:
     if not chunks:
         raise ValueError("No embedding artifacts matched the requested virtual cohort.")
+
     return {
         "embeddings": torch.cat([chunk["embeddings"] for chunk in chunks], dim=0),
         "subjects": torch.cat([chunk["subjects"] for chunk in chunks], dim=0),
@@ -99,15 +100,18 @@ def load_virtual_population_embeddings(
     """
     requested = {int(subject) for subject in subjects}
     chunks: list[dict] = []
+
     for split_name in ("train", "eval"):
         split_subjects = {
             int(subject)
             for subject in split_manifest[modality][f"{split_name}_subjects"]
         }
         selected = sorted(requested & split_subjects)
+
         if selected:
             artifact = load_embeddings(root / modality / model_name / f"{split_name}_embeddings.pt")
             chunks.append(_filter_data(artifact, selected))
+
     return _merge_embedding_data(chunks)
 
 def _build_fusion_modality(
@@ -130,6 +134,7 @@ def _build_fusion_modality(
     # class in the key. Subject-level templates use the virtual subject directly.
     mapped_templates: dict[str, torch.Tensor] = {}
     template_subjects: dict[str, str] = {}
+
     for key, embedding in templates.items():
         subject = str(subject_key_fn(key)) if instance_level_enrollment else str(key)
         mapped_key = f"{subject}::{key}" if instance_level_enrollment else subject
@@ -148,11 +153,13 @@ def _build_fusion_modality(
     mapped_queries["class_keys"] = mapped_class_keys
     mapped_queries["template_subjects"] = template_subjects
     mapped_queries["instance_level"] = instance_level_verification
+
     return mapped_templates, mapped_queries
 
 
 def _pair_trials(fp_queries: dict, iris_queries: dict) -> list[tuple[str, int, int]]:
     subjects = sorted(set(fp_queries["groups"]) & set(iris_queries["groups"]))
+
     return [
         (subject, fp_index, iris_index)
         for subject in subjects
@@ -181,6 +188,28 @@ def _genuine_mask(
             return query_key == template_key
         return template_subject == query_subject
     return template_subject == query_subject
+
+def _fit_feature_standardizer(templates: dict[str, torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fit a per-dimension standardizer using enrollment templates only.
+
+    Feature-level fusion operates in a standardized concatenated feature space.
+    This avoids the exact algebraic equivalence to weighted score fusion that
+    occurs when each modality is only multiplied by a scalar and L2-normalized.
+    """
+    matrix = torch.stack([templates[key] for key in sorted(templates)]).float()
+    mean = matrix.mean(dim=0)
+    # Population standard deviation is stable for small cohorts; dimensions
+    # with negligible variance are left at unit scale rather than amplified.
+    std = matrix.std(dim=0, unbiased=False)
+    scale = torch.where(std > 1e-6, std, torch.ones_like(std))
+    return mean, scale
+
+
+def _standardize_features(
+    vectors: torch.Tensor, mean: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    return (vectors.float() - mean) / scale
+
 
 def evaluate_fusion_pair(
     fingerprint_data: dict,
@@ -220,6 +249,7 @@ def evaluate_fusion_pair(
         class_key_to_subject_id(p["iris_id"]): str(p["virtual_id"])
         for p in pairing_records
     }
+
     if len(fp_virtual_ids) != len(pairing_records) or len(iris_virtual_ids) != len(pairing_records):
         raise ValueError("Each source subject may appear in only one virtual fusion pairing.")
 
@@ -236,6 +266,7 @@ def evaluate_fusion_pair(
         config.FUSION_VIRTUAL_ENROLLMENT,
         config.FUSION_VIRTUAL_VERIFICATION,
     )
+
     iris_templates, iris_queries = _build_fusion_modality(
         _filter_data(iris_data, iris_subjects),
         IRIS_PROTOCOL,
@@ -255,6 +286,7 @@ def evaluate_fusion_pair(
     iris_subjects_by_template = iris_queries["template_subjects"]
 
     fp_weight = float(fingerprint_weight)
+
     if not 0.0 <= fp_weight <= 1.0:
         raise ValueError("fingerprint_weight must be between 0 and 1.")
     iris_weight = 1.0 - fp_weight
@@ -267,11 +299,14 @@ def evaluate_fusion_pair(
     fused_fp_indices: list[int] = []
     fused_iris_indices: list[int] = []
     fused_subjects: list[str] = []
+
     for subject in sorted(set(fp_queries["groups"]) & set(iris_queries["groups"])):
         fp_subject_keys = [k for k in fp_keys if fp_subjects_by_template[k] == subject]
         iris_subject_keys = [k for k in iris_keys if iris_subjects_by_template[k] == subject]
+        
         for fp_key in fp_subject_keys:
             fp_index = fp_keys.index(fp_key)
+            
             for iris_key in iris_subject_keys:
                 fused_fp_indices.append(fp_index)
                 fused_iris_indices.append(iris_keys.index(iris_key))
@@ -291,8 +326,12 @@ def evaluate_fusion_pair(
     iris_genuine = torch.zeros((len(iris_query_keys), len(iris_keys)), dtype=torch.bool)
     fp_key_to_index = {key: index for index, key in enumerate(fp_keys)}
     iris_key_to_index = {key: index for index, key in enumerate(iris_keys)}
+
     for row, (query_key, subject) in enumerate(zip(fp_query_keys, fp_query_subjects)):
-        if config.FUSION_VIRTUAL_ENROLLMENT and fp_queries.get("instance_level", True):
+        if (
+            config.FUSION_VIRTUAL_ENROLLMENT
+            and config.FUSION_VIRTUAL_VERIFICATION
+        ):
             if query_key not in fp_key_to_index:
                 raise ValueError(f"Verification key has no enrollment template: {query_key}")
             fp_genuine[row, fp_key_to_index[query_key]] = True
@@ -302,7 +341,9 @@ def evaluate_fusion_pair(
             # genuine. This is the mixed-granularity ablation.
             for index, key in enumerate(fp_keys):
                 fp_genuine[row, index] = fp_subjects_by_template[key] == subject
+
     for row, (query_key, subject) in enumerate(zip(iris_query_keys, iris_query_subjects)):
+        
         if config.FUSION_VIRTUAL_ENROLLMENT and iris_queries.get("instance_level", True):
             if query_key not in iris_key_to_index:
                 raise ValueError(f"Verification key has no enrollment template: {query_key}")
@@ -318,6 +359,7 @@ def evaluate_fusion_pair(
     # Chunking keeps peak memory bounded while still moving the expensive
     # Cartesian score construction into optimized PyTorch tensor operations.
     chunk_size = int(getattr(config, "FUSION_SCORE_BATCH_SIZE", 1024))
+
     if chunk_size <= 0:
         raise ValueError("FUSION_SCORE_BATCH_SIZE must be positive.")
 
@@ -327,30 +369,134 @@ def evaluate_fusion_pair(
     fused_fp_indices_device = fused_fp_indices_t.to(device)
     fused_iris_indices_device = fused_iris_indices_t.to(device)
 
+    
     genuine_chunks: list[np.ndarray] = []
     impostor_chunks: list[np.ndarray] = []
+    feature_genuine_chunks: list[np.ndarray] = []
+    feature_impostor_chunks: list[np.ndarray] = []
 
-    # Feature-level fusion is mathematically identical to score-level fusion
-    # here: both modality vectors/templates are L2-normalized and scaled by
-    # sqrt(weight), so their concatenated cosine equals
-    # w*FP_cosine + (1-w)*Iris_cosine. Reuse the exact score-level values.
+    # Feature-level fusion uses a modality-wise standardized feature space.
+    # Fit each transform on enrollment templates only, then concatenate and
+    # normalize once. Unlike scalar-only weighting, this dimension-wise
+    # transform makes feature fusion genuinely different from score fusion.
+    fp_feature_mean, fp_feature_scale = _fit_feature_standardizer(fp_templates)
+    iris_feature_mean, iris_feature_scale = _fit_feature_standardizer(iris_templates)
+
+    feature_template_vectors = []
+    for fp_index, iris_index in zip(fused_fp_indices, fused_iris_indices):
+        fp_vector = _standardize_features(
+            fp_templates[fp_keys[fp_index]], fp_feature_mean, fp_feature_scale
+        )
+        iris_vector = _standardize_features(
+            iris_templates[iris_keys[iris_index]], iris_feature_mean, iris_feature_scale
+        )
+        feature_template_vectors.append(
+            torch.cat((fp_scale * fp_vector, iris_scale * iris_vector), dim=0)
+        )
+
+    feature_template_matrix = F.normalize(
+        torch.stack(feature_template_vectors), p=2, dim=1
+    ).to(device)
+
     for start in range(0, len(trials), chunk_size):
         end = min(start + chunk_size, len(trials))
-        fp_query = trial_fp_indices[start:end].to(device)
-        iris_query = trial_iris_indices[start:end].to(device)
-        fp_component = fp_score_device[fp_query][:, fused_fp_indices_device]
-        iris_component = iris_score_device[iris_query][:, fused_iris_indices_device]
-        fused_chunk = fp_weight * fp_component + iris_weight * iris_component
 
-        fp_match = fp_genuine[trial_fp_indices[start:end]][:, fused_fp_indices_t]
-        iris_match = iris_genuine[trial_iris_indices[start:end]][:, fused_iris_indices_t]
-        genuine_mask = fp_match & iris_match
+        fp_query_idx = trial_fp_indices[start:end]
+        iris_query_idx = trial_iris_indices[start:end]
 
-        genuine_chunks.append(fused_chunk[genuine_mask.to(device)].detach().cpu().numpy().astype(np.float32))
-        impostor_chunks.append(fused_chunk[~genuine_mask.to(device)].detach().cpu().numpy().astype(np.float32))
+        fp_query_device = fp_query_idx.to(device)
+        iris_query_device = iris_query_idx.to(device)
 
-    genuine_score = np.concatenate(genuine_chunks) if genuine_chunks else np.empty(0, dtype=np.float32)
-    impostor_score = np.concatenate(impostor_chunks) if impostor_chunks else np.empty(0, dtype=np.float32)
+        # ---------------------------------------------------------
+        # Score-level fusion: retain the existing weighted scores.
+        # ---------------------------------------------------------
+        fp_component = fp_score_device[fp_query_device][
+            :, fused_fp_indices_device
+        ]
+        iris_component = iris_score_device[iris_query_device][
+            :, fused_iris_indices_device
+        ]
+
+        score_chunk = (
+            fp_weight * fp_component
+            + iris_weight * iris_component
+        )
+
+        # ---------------------------------------------------------
+        # Feature-level fusion: concatenate original embeddings,
+        # then calculate cosine similarity in the fused space.
+        # ---------------------------------------------------------
+        fp_query_vectors = _standardize_features(
+            fp_queries["embeddings"][fp_query_idx],
+            fp_feature_mean,
+            fp_feature_scale,
+        )
+        iris_query_vectors = _standardize_features(
+            iris_queries["embeddings"][iris_query_idx],
+            iris_feature_mean,
+            iris_feature_scale,
+        )
+
+        fused_query_vectors = torch.cat(
+            (fp_scale * fp_query_vectors, iris_scale * iris_query_vectors),
+            dim=1,
+        )
+
+        fused_query_vectors = F.normalize(
+            fused_query_vectors,
+            p=2,
+            dim=1,
+        ).to(device)
+
+        feature_chunk = (
+            fused_query_vectors @ feature_template_matrix.T
+        )
+
+        # The same protocol-derived genuine/impostor mask applies to
+        # both scoring methods.
+        fp_match = fp_genuine[fp_query_idx][
+            :, fused_fp_indices_t
+        ]
+        iris_match = iris_genuine[iris_query_idx][
+            :, fused_iris_indices_t
+        ]
+        genuine_mask = (fp_match & iris_match).to(device)
+
+        genuine_chunks.append(
+            score_chunk[genuine_mask]
+            .detach().cpu().numpy().astype(np.float32)
+        )
+        impostor_chunks.append(
+            score_chunk[~genuine_mask]
+            .detach().cpu().numpy().astype(np.float32)
+        )
+
+        feature_genuine_chunks.append(
+            feature_chunk[genuine_mask]
+            .detach().cpu().numpy().astype(np.float32)
+        )
+        feature_impostor_chunks.append(
+            feature_chunk[~genuine_mask]
+            .detach().cpu().numpy().astype(np.float32)
+        )
+
+    genuine_score = (
+        np.concatenate(genuine_chunks)
+        if genuine_chunks else np.empty(0, dtype=np.float32)
+    )
+    impostor_score = (
+        np.concatenate(impostor_chunks)
+        if impostor_chunks else np.empty(0, dtype=np.float32)
+    )
+
+    feature_genuine_score = (
+        np.concatenate(feature_genuine_chunks)
+        if feature_genuine_chunks else np.empty(0, dtype=np.float32)
+    )
+    feature_impostor_score = (
+        np.concatenate(feature_impostor_chunks)
+        if feature_impostor_chunks else np.empty(0, dtype=np.float32)
+    )
 
     # Preserve the existing baseline semantics, but compute them directly from
     # the already-built modality score matrices rather than rescanning every
@@ -359,6 +505,7 @@ def evaluate_fusion_pair(
     fp_baseline_impostor = []
     iris_baseline_genuine = []
     iris_baseline_impostor = []
+
     for start in range(0, len(trials), chunk_size):
         end = min(start + chunk_size, len(trials))
         fp_idx = trial_fp_indices[start:end]
@@ -386,20 +533,36 @@ def evaluate_fusion_pair(
 
     score_result = package(genuine_score, impostor_score)
 
-    # Build feature-level fused enrollment vectors for the PCA visualization.
-    # The score-level and feature-level authentication scores are equivalent
-    # under the current sqrt-weighted normalized construction, but the actual
-    # concatenated vectors are still useful for inspecting representation
-    # structure.
+    feature_result = package(
+        feature_genuine_score,
+        feature_impostor_score,
+    )
+
+    # Build standardized feature-level enrollment vectors for PCA visualization.
+
     feature_vectors = []
     feature_labels = []
+
     for fp_index, iris_index, subject in zip(
         fused_fp_indices, fused_iris_indices, fused_subjects
     ):
-        fp_vector = F.normalize(fp_templates[fp_keys[fp_index]].float(), p=2, dim=0)
-        iris_vector = F.normalize(iris_templates[iris_keys[iris_index]].float(), p=2, dim=0)
-        feature_vectors.append(torch.cat((fp_scale * fp_vector, iris_scale * iris_vector)))
+        fp_vector = _standardize_features(
+            fp_templates[fp_keys[fp_index]], fp_feature_mean, fp_feature_scale
+        )
+        iris_vector = _standardize_features(
+            iris_templates[iris_keys[iris_index]], iris_feature_mean, iris_feature_scale
+        )
+
+        fused_vector = torch.cat(
+            (fp_scale * fp_vector, iris_scale * iris_vector),
+            dim=0,
+        )
+
+        feature_vectors.append(
+            F.normalize(fused_vector, p=2, dim=0)
+        )
         feature_labels.append(subject)
+
     feature_embeddings = (
         torch.stack(feature_vectors).cpu().numpy().astype(np.float32)
         if feature_vectors
@@ -408,7 +571,7 @@ def evaluate_fusion_pair(
 
     return {
         "score_level": score_result,
-        "feature_level": score_result,
+        "feature_level": feature_result,
         "fingerprint_baseline": package(fp_baseline_genuine, fp_baseline_impostor),
         "iris_baseline": package(iris_baseline_genuine, iris_baseline_impostor),
         "virtual_ids": [p["virtual_id"] for p in pairing_records],

@@ -386,11 +386,11 @@ def run_fusion(
         fusion_rows = [
             row for row in records if row["method"] in ("score_level", "feature_level")
         ]
-        plot_metric_bars(
-            output / "plots" / "comparisions" / "eer_comparison.png",
+        plot_fusion_method_comparison(
+            output / "plots" / "comparisons" / "eer_comparison.png",
             fusion_rows,
             "eer",
-            "Synthetic fusion EER comparison",
+            "Synthetic fusion EER comparison — all model combinations",
         )
         plot_fusion_method_comparison(
             output / "plots" / "comparisons" / "fusion_accuracy_comparison.png",

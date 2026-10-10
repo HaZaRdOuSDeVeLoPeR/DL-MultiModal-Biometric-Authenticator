@@ -14,7 +14,7 @@ Quick start:
 """
 
 from pathlib import Path
-
+import os
 
 # ============================================================
 # Project paths
@@ -124,7 +124,7 @@ BATCH_SIZE = 32
 NUM_EPOCHS = 30
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 12
+NUM_WORKERS = os.cpu_count()
 USE_AMP = True
 SAVE_BEST_ONLY = True
 TRAIN_DETERMINISTIC = True

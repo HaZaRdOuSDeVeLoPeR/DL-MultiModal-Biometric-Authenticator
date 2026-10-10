@@ -1,349 +1,313 @@
 # Fingerprint + Iris Biometric Authentication
 
-A deep-learning-based multimodal biometric authentication project using CNN embeddings for fingerprint and iris recognition. The project supports MobileNetV2, ResNet18, and EfficientNet-B0, standalone authentication experiments, synthetic fingerprint+iris fusion, and configurable instance-level vs subject-level authentication protocols.
+A research and experimentation project for **deep-learning-based fingerprint and iris authentication**. It trains CNN-based embedding models, evaluates each modality independently, and investigates two ways of combining fingerprint and iris evidence. The code is organized so that training, embedding extraction, authentication protocols, fusion, metrics, and plotting can be run and inspected separately.
 
-## Project structure
+> **Research caveat:** the available fingerprint and iris datasets contain independent subject populations. The fusion experiment pairs held-out subjects into deterministic *synthetic virtual identities*. These results are useful for testing the implemented fusion pipeline, but they are **not** results from genuinely paired fingerprint and iris samples belonging to the same people.
+
+## Contents
+
+- [Highlights](#highlights)
+- [Repository structure](#repository-structure)
+- [Requirements](#requirements)
+- [Dataset layout](#dataset-layout)
+- [Installation and setup](#installation-and-setup)
+- [Run the pipeline](#run-the-pipeline)
+- [Run authentication experiments](#run-authentication-experiments)
+- [Configure the protocol](#configure-the-protocol)
+- [Fusion methods](#fusion-methods)
+- [Metrics and plots](#metrics-and-plots)
+- [Outputs](#outputs)
+- [Reproducibility and limitations](#reproducibility-and-limitations)
+- [Further documentation](#further-documentation)
+
+## Highlights
+
+- CNN backbones: **MobileNetV2**, **ResNet18**, and **EfficientNet-B0**.
+- Fixed-size, 512-dimensional biometric embeddings by default.
+- Subject-disjoint training/evaluation splits, persisted in a split manifest.
+- Separate fingerprint and iris enrollment/verification protocols.
+- Independent controls for instance-level and subject-level enrollment and verification.
+- Synthetic fingerprint–iris fusion using score-level and feature-level methods.
+- Evaluation with ROC AUC, EER, FAR, FRR, accuracy at the EER threshold, d-prime, and TAR at configured FAR targets.
+- Reproducible experiment artifacts, JSON/CSV metrics, saved genuine/impostor score arrays, and plots.
+- Chunked tensor scoring for computationally expensive instance-level fusion.
+
+## Repository structure
 
 ```text
 Fingerprint-Iris-Authentication/
-├── config.py                    # Central user-editable configuration
-├── main.py                      # Training + embedding extraction pipeline
-├── requirements.txt
+├── config.py                    # Dataset, training, protocol, fusion and plotting settings
+├── main.py                      # Validate data, prepare splits, train models, extract embeddings
+├── requirements.txt             # Python dependencies
 ├── src/
-│   ├── datasets.py              # Dataset loading and subject splits
-│   ├── models.py                # CNN backbone dispatch
-│   ├── preprocessing.py
-│   ├── train.py
-│   ├── embeddings.py
-│   └── authentication.py        # Enrollment, verification, templates, scoring
+│   ├── datasets.py              # Dataset classes, subject split, split manifest
+│   ├── preprocessing.py         # Train/evaluation image transforms
+│   ├── models.py                # CNN backbone and embedding/classification heads
+│   ├── train.py                 # Training loop, checkpoints and training history
+│   ├── embeddings.py            # Checkpoint loading and embedding extraction
+│   └── authentication.py        # Enrollment split, templates, validation and similarity scoring
 ├── experiments/
-│   ├── __main__.py
-│   ├── run.py                   # Experiment orchestration
-│   ├── protocols.py             # Configurable authentication protocols
-│   ├── fusion.py                # Synthetic FP+iris fusion
-│   ├── metrics.py               # AUC, EER, FAR/FRR, accuracy, etc.
-│   ├── analysis.py
-│   ├── plots.py
-│   └── io.py
-├── tests/
-│   └── test_experiments.py
-├── ui/
-│   ├── app.py                    # Flask/Jinja manual authentication UI
-│   ├── templates/
-│   └── static/
-├── datasets/
-├── results/
-├── experiment_fingerprint.ipynb
-├── experiment_iris.ipynb
-├── experiment_fused.ipynb
-└── DOCUMENTATION.md
+│   ├── __main__.py              # Enables `python -m experiments`
+│   ├── run.py                   # CLI, experiment orchestration and output writing
+│   ├── protocols.py             # Standalone authentication protocols and aggregation
+│   ├── fusion.py                # Virtual pairing, fusion scoring and fusion baselines
+│   ├── metrics.py               # ROC, AUC, EER and operating-point metrics
+│   ├── analysis.py              # DET data, PCA, bootstrap intervals and fusion deltas
+│   ├── plots.py                 # Metric and diagnostic plots
+│   └── io.py                    # Load/save artifacts, metrics and score arrays
+├── utils/
+│   ├── data_validator.py        # Dataset structure and image validation
+│   ├── device.py                # CPU/CUDA selection and device information
+│   ├── random_utils.py          # Random seeds and deterministic/performance flags
+│   └── cleanup.py               # Removes generated Python bytecode caches
+├── docs/
+│   └── DOCUMENTATION.md         # Detailed architecture and implementation guide
+├── experiment_fingerprint.ipynb # Fingerprint exploration/experiment notebook
+├── experiment_iris.ipynb        # Iris exploration/experiment notebook
+└── experiment_fused.ipynb       # Fusion exploration/experiment notebook
 ```
 
-## Quick start
+`datasets/` and `results/` are runtime data/output directories and may not be included in a source archive. The program creates output subdirectories when needed. The actual dataset files must be placed in the expected layout described below.
+
+## Requirements
+
+- Python version compatible with the installed PyTorch and torchvision builds.
+- PyTorch and torchvision (the supplied requirements pin CUDA 13.0 builds).
+- A CUDA-capable NVIDIA GPU is recommended for training, but the code selects CPU if CUDA is unavailable.
+- Enough storage for the source datasets, model checkpoints, embeddings, and experiment score arrays.
+
+The exact pinned PyTorch versions in `requirements.txt` are intentional project dependencies. Install a wheel compatible with your Python version and platform if those particular wheels are unavailable for your environment.
+
+## Dataset layout
+
+The paths are controlled by `config.py` and default to `datasets/fingerprints/` and `datasets/iris/`.
+
+Fingerprint images are expected at:
+
+```text
+datasets/fingerprints/<subject_id>/<finger>/<subject_id>_<finger>_<impression>.bmp
+```
+
+Example:
+
+```text
+datasets/fingerprints/004/L0/004_L0_0.bmp
+datasets/fingerprints/004/L0/004_L0_1.bmp
+...
+datasets/fingerprints/004/R3/004_R3_4.bmp
+```
+
+There are eight finger classes per subject: `L0`–`L3` and `R0`–`R3`. Subject IDs are zero-padded to three digits in paths.
+
+Iris images are expected at:
+
+```text
+datasets/iris/<subject_id>/<eye>/<subject_id>_<eye>_<impression:02d>.jpg
+```
+
+Example:
+
+```text
+datasets/iris/004/L/004_L_00.jpg
+datasets/iris/004/L/004_L_01.jpg
+...
+datasets/iris/004/R/004_R_09.jpg
+```
+
+The default configuration expects 500 fingerprint subjects with 8 fingers and 5 impressions per finger, and 1,000 iris subjects with left/right eyes and 10 impressions per eye. Image extensions, counts, and expected source dimensions are defined in `config.py`. `main.py` runs structural and image-integrity checks before training.
+
+## Default evaluation protocol
+
+The classifier learns a separate class for each subject+finger (fingerprint) or subject+eye (iris). Enrollment and verification use disjoint impressions:
+
+| Modality | Evaluation subjects | Biometric units per subject | Impressions per unit | Enrollment | Verification |
+|---|---:|---:|---:|---:|---:|
+| Fingerprint | 250 | 8 fingers | 5 | 2 per finger | 3 per finger |
+| Iris | 500 | 2 eyes | 10 | 4 per eye | 6 per eye |
+
+With the default instance-level standalone settings, that is 2,000 fingerprint enrollment templates and 6,000 fingerprint verification queries; iris has 1,000 enrollment templates and 6,000 verification queries. Subject-level pooling changes the unit of authentication and produces one enrollment template per subject with 3 fingerprint or 6 iris verification templates per subject.
+
+The default headline fusion experiment pairs 250 held-out fingerprint subjects with 250 held-out iris subjects. With instance-level fusion enrollment and verification, the cross-product is 16 fused enrollment templates and 288 multimodal query pairs per virtual identity. Actual counts depend on the four granularity switches in `config.py`.
+
+## Installation and setup
+
+From the repository root:
 
 ```bash
-# Full training + embedding extraction
-python3 main.py
+# Create an environment (optional if you already use a suitable shared environment).
+python3 -m venv .venv
+source .venv/bin/activate
 
-# Standalone fingerprint
+# Upgrade the installer and install the project dependencies.
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+On Windows, activate the environment with `.venv\\Scripts\\activate`. If the pinned CUDA PyTorch wheels cannot be resolved, install a PyTorch/torchvision pair compatible with your Python, OS, and CUDA runtime using the official PyTorch installation instructions, then install the remaining dependencies from `requirements.txt` without replacing that compatible pair.
+
+Before running the pipeline:
+
+1. Place the datasets in the directory layout above.
+2. Review `config.py`, especially the dataset counts, train/evaluation split sizes, training parameters, and authentication granularity switches.
+3. Ensure sufficient disk space under `results/`.
+
+## Run the pipeline
+
+### Train all configured models and extract embeddings
+
+```bash
+python3 main.py
+```
+
+This entry point seeds the random number generators, validates both datasets, creates or loads the subject-wise split, prepares training and evaluation datasets, selects CPU/CUDA, trains the configured models, and extracts embeddings for downstream authentication experiments. Model checkpoints, histories, the subject split, and embeddings are saved under `results/`.
+
+The configured models are trained for both modalities, so a full run can be computationally expensive. Pretrained torchvision weights may need to be downloaded on the first run unless already cached.
+
+### Run experiments using existing artifacts
+
+The experiment CLI evaluates existing embedding artifacts; it does **not** retrain the CNNs.
+
+```bash
+# Fingerprint only
 python3 -m experiments --modality fingerprint
 
-# Standalone iris
+# Iris only
 python3 -m experiments --modality iris
 
 # Synthetic fusion
 python3 -m experiments --modality fusion
 
-# All experiments
+# Run fingerprint, iris, and fusion experiments
 python3 -m experiments --modality all
 ```
 
-Use `--no-plots` to skip plot generation.
+Choose a subset of architectures with `--models`:
 
-## Pipeline
+```bash
+python3 -m experiments --modality fusion --models mobilenet_v2,resnet18
+```
 
-The project has three major stages:
+Skip plot generation with `--no-plots`:
 
-1. **Training** — CNNs learn discriminative biometric representations from labeled fingerprint/iris classes.
-2. **Embedding extraction** — the classifier backbone produces fixed-size embeddings.
-3. **Authentication** — enrollment embeddings form templates; held-out embeddings are verification queries; cosine similarity produces genuine and impostor scores.
+```bash
+python3 -m experiments --modality fusion --no-plots
+```
 
-Training classes remain modality-specific:
+Bootstrap confidence intervals are disabled by default. Enable them with, for example:
 
-- Fingerprint: `subject + finger`
-- Iris: `subject + eye`
+```bash
+python3 -m experiments --modality fusion --bootstrap-iterations 200 --bootstrap-seed 37
+```
 
-The authentication protocol can then operate either at this instance level or after pooling instances to the subject level.
+The full virtual-population diagnostic is an explicitly separate, non-headline path and can be requested with `--include-nonheldout-diagnostic`. Its output must not be presented as a held-out evaluation result because it may include subjects used during training.
 
-## Enrollment and verification
+## Configure the protocol
 
-The configured datasets contain:
-
-### Fingerprint
-
-- 500 subjects
-- 8 fingers per subject
-- 5 impressions per finger
-- 2 enrollment impressions
-- 3 verification impressions
-
-At instance level:
-
-- 2 samples from each finger are averaged into one finger template.
-- 8 fingers × 250 evaluation subjects = **2,000 enrollment templates**.
-- 3 verification samples × 8 fingers × 250 subjects = **6,000 verification queries**.
-
-At subject level:
-
-- All enrollment embeddings from the subject's 8 fingers are averaged into one subject template.
-- Each verification impression is averaged across the 8 fingers, producing 3 subject-level verification templates per subject.
-
-### Iris
-
-- 1,000 subjects
-- 2 eyes per subject
-- 10 impressions per eye
-- 4 enrollment impressions
-- 6 verification impressions
-
-At instance level:
-
-- 4 samples from each eye are averaged into one eye template.
-- 2 eyes × 250 evaluation subjects = **500 enrollment templates**.
-- 6 verification samples × 2 eyes × 250 subjects = **3,000 verification queries**.
-
-At subject level:
-
-- All enrollment embeddings from both eyes are averaged into one subject template.
-- Each verification impression is averaged across both eyes, producing 6 subject-level verification templates per subject.
-
-## Authentication granularity configuration
-
-The following four switches in `config.py` control enrollment and verification independently:
+All primary settings are in `config.py`. The four granularity switches are independent:
 
 ```python
 STANDALONE_VIRTUAL_ENROLLMENT = True
 STANDALONE_VIRTUAL_VERIFICATION = True
 
 FUSION_VIRTUAL_ENROLLMENT = False
-FUSION_VIRTUAL_VERIFICATION = False
-```
-
-`True` means **instance-level** operation: individual fingers/eyes remain separate.
-
-`False` means **subject-level** operation: the corresponding fingerprint fingers or iris eyes are pooled by averaging.
-
-The settings are independent so mixed-granularity protocols can also be evaluated for ablation studies.
-
-### Typical standalone configurations
-
-**Instance-level standalone:**
-
-```python
-STANDALONE_VIRTUAL_ENROLLMENT = True
-STANDALONE_VIRTUAL_VERIFICATION = True
-```
-
-This is the standard finger-specific/eye-specific authentication protocol.
-
-**Subject-level standalone:**
-
-```python
-STANDALONE_VIRTUAL_ENROLLMENT = False
-STANDALONE_VIRTUAL_VERIFICATION = False
-```
-
-This measures authentication after multi-finger/multi-eye aggregation.
-
-## Synthetic fusion
-
-The fingerprint and iris evaluation cohorts are independent and do not represent the same physical people. Fusion therefore creates deterministic **synthetic virtual identities** by pairing held-out fingerprint and iris subjects positionally.
-
-For example:
-
-```text
-Virtual ID 0 = fingerprint evaluation subject A + iris evaluation subject B
-Virtual ID 1 = fingerprint evaluation subject C + iris evaluation subject D
-...
-```
-
-This is a synthetic fusion experiment, not a claim that the two source subjects are the same person.
-
-### Instance-level fusion
-
-With:
-
-```python
-FUSION_VIRTUAL_ENROLLMENT = True
 FUSION_VIRTUAL_VERIFICATION = True
 ```
 
-each finger and eye remains separate.
+- `True`: retain separate biometric instances (each finger or eye).
+- `False`: pool biometric instances to the subject level by averaging embeddings.
 
-Enrollment:
+The defaults above intentionally configure standalone experiments at instance level and fusion at subject-level enrollment with instance-level verification. Set both switches for a workflow to `True` for instance-level enrollment and verification, or both to `False` for subject-level enrollment and verification. Mixed settings are supported as ablations; document the exact settings alongside any reported result.
 
-- 8 fingerprint finger templates
-- 2 iris eye templates
-- Cartesian product = **16 fused enrollment templates per virtual subject**
+The current default fusion settings are a mixed-granularity protocol. Do not describe results as fully subject-level fusion unless both fusion switches are `False`.
 
-Verification:
+Other important settings include:
 
-- 8 fingers × 3 samples = 24 fingerprint queries
-- 2 eyes × 6 samples = 12 iris queries
-- Cartesian product = **288 multimodal query pairs per virtual subject**
+| Setting | Purpose |
+|---|---|
+| `RANDOM_SEED` | Seed for deterministic splitting and random operations |
+| `MODEL_NAMES` | CNN architectures evaluated by the pipeline |
+| `IMAGE_SIZE` | Square input resolution after resize/pad |
+| `EMBEDDING_DIM` | Output embedding dimension (default 512) |
+| `BATCH_SIZE`, `NUM_EPOCHS` | Training batch size and epochs |
+| `LEARNING_RATE`, `WEIGHT_DECAY` | Optimizer hyperparameters |
+| `USE_AMP`, `AMP_DTYPE` | Mixed-precision training configuration |
+| `TRAIN_DETERMINISTIC`, `ENABLE_TF32` | Reproducibility/performance controls |
+| `FUSION_FINGERPRINT_WEIGHT` | Fingerprint contribution to score-level fusion; iris weight is its complement |
+| `FUSION_SCORE_BATCH_SIZE` | Maximum number of cross-modal query pairs scored in one fusion batch |
+| `EXPERIMENT_PAIRS` | Number of held-out source-subject pairs in headline fusion |
+| `FAR_TARGETS` | FAR targets for TAR reporting |
+| `PCA_MAX_POINTS`, `SCORE_HISTOGRAM_BINS` | Plot/analysis limits |
 
-With 250 virtual subjects:
-
-- **72,000 multimodal verification query pairs**
-
-Each query pair is scored against the appropriate combined enrollment templates. A fused template is genuine only when both its fingerprint and iris components match the query's authentication unit.
-
-**Performance note:** Instance-level fusion can produce a large all-to-all score set (72,000 query pairs against 4,000 fused enrollment templates for the 250-subject configuration). The implementation therefore constructs fusion scores in vectorized tensor batches controlled by `FUSION_SCORE_BATCH_SIZE` (default `1024`) instead of using nested Python loops. CUDA is used automatically for this tensor-scoring stage when available; metric calculation and plotting remain CPU/NumPy based.
-
-### Subject-level fusion
-
-With:
-
-```python
-FUSION_VIRTUAL_ENROLLMENT = False
-FUSION_VIRTUAL_VERIFICATION = False
-```
-
-each virtual subject has:
-
-- 1 fingerprint enrollment template from all 8 fingers
-- 1 iris enrollment template from both eyes
-- 3 fingerprint verification templates
-- 6 iris verification templates
-
-The verification Cartesian product is therefore:
-
-\[
-3 	imes 6 = 18
-\]
-
-multimodal query pairs per virtual subject, or **4,500** for 250 virtual subjects.
-
-### Important interpretation
-
-The fusion baseline and standalone baseline can represent different authentication granularities. In particular, a subject-level fusion fingerprint baseline should not be directly compared with a single-finger standalone EER as if they were the same system. Subject-level aggregation itself can substantially improve performance.
+See [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) for every configuration section, algorithms, data flow, metric definitions, output formats, and implementation details.
 
 ## Fusion methods
 
-Two fusion methods are evaluated:
+- **Score-level fusion:** compute fingerprint and iris cosine similarities separately and combine them with `FUSION_FINGERPRINT_WEIGHT` and `1 - FUSION_FINGERPRINT_WEIGHT`.
+- **Feature-level fusion:** fit a per-dimension standardizer using enrollment templates only for each modality, standardize the corresponding query/template embeddings, apply square-root modality weights, concatenate the feature vectors, L2-normalize, and compute cosine similarity. Dimensions with near-zero enrollment standard deviation use unit scale to avoid amplifying numerical noise.
 
-- **Score-level fusion** — weighted combination of fingerprint and iris cosine similarities.
-- **Feature-level fusion** — weighted concatenation of the two normalized embeddings followed by cosine similarity.
+Feature-level fusion is not merely square-root-weighted concatenation of the original normalized embeddings: the enrollment-only dimension-wise standardization is what makes its scoring space distinct from score-level fusion. The transform is fitted on enrollment templates only to avoid fitting it to verification samples. See the technical documentation for equations and trial construction.
 
-The fingerprint weight is controlled by:
+Fusion is computed in vectorized, chunked tensor batches controlled by `FUSION_SCORE_BATCH_SIZE`. CUDA is used for the scoring stage when available. The final score arrays and metric calculations are handled using NumPy/CPU operations, so a full instance-level run can still be memory-intensive.
 
-```python
-FUSION_FINGERPRINT_WEIGHT = 0.5
-```
+## Metrics and plots
 
-The iris weight is `1 - FUSION_FINGERPRINT_WEIGHT`.
+Metrics include:
 
-## Metrics
-
-Each experiment saves:
-
-- AUC
-- EER
-- EER threshold
-- FAR at EER
-- FRR at EER
-- **Accuracy at EER threshold**
-- Genuine mean/std/median
-- Impostor mean/std/median
+- ROC AUC
+- Equal Error Rate (EER) and its threshold
+- FAR and FRR at the EER threshold
+- Accuracy at the EER threshold
+- Genuine/impostor score mean, standard deviation, and median
 - d-prime
-- Genuine trial count
-- Impostor trial count
+- Genuine and impostor trial counts
 - TAR at configured FAR targets
 
-Accuracy is defined at the EER operating threshold:
+Accuracy is threshold-dependent and is influenced by the number of genuine and impostor scores. Interpret it together with EER, FAR/FRR, and AUC, not as a standalone measure.
 
-\[
-Accuracy = rac{TP + TN}{TP + TN + FP + FN}
-\]
-
-where similarity scores at or above the threshold are accepted.
-
-Because biometric experiments can have many more impostor scores than genuine scores, accuracy should be interpreted together with EER, FAR, FRR, and AUC rather than as the sole performance measure.
+Plots include genuine/impostor score distributions, ROC curves, DET curves, FAR/FRR versus threshold, PCA projections, training history, EER/accuracy comparisons, and fusion improvement comparisons. ROC plots use conventional linear FAR/TAR axes with a zoomed high-performing region. DET plots use normal-deviate probability axes and a low-error inset. FAR/FRR plots use a logarithmic error-rate axis with a display floor; the display floor does not change the stored metric values.
 
 ## Outputs
 
-For each modality:
+Typical generated paths include:
 
 ```text
-results/experiments/<modality>/
-├── metrics.json
-├── metrics.csv
-├── bootstrap_intervals.json
-├── scores/
-└── plots/
-    ├── distributions/
-    ├── roc/
-    ├── det/
-    ├── far_frr/
-    ├── pca/
-    └── comparisons/
-        ├── eer_comparison.png
-        └── accuracy_comparison.png
+results/
+├── subject_split.json
+├── models/                         # Model checkpoints
+├── embeddings/                     # Saved train/evaluation embeddings
+└── experiments/
+    ├── fingerprint/
+    │   ├── metrics.json
+    │   ├── metrics.csv
+    │   ├── scores/
+    │   └── plots/
+    ├── iris/
+    │   ├── metrics.json
+    │   ├── metrics.csv
+    │   ├── scores/
+    │   └── plots/
+    └── fusion/
+        ├── metrics.json
+        ├── metrics.csv
+        ├── fusion_delta.json
+        ├── fusion_delta.csv
+        ├── pairing.json
+        ├── manifest.json
+        ├── scores/
+        └── plots/
 ```
 
-Fusion additionally produces:
+Exact artifact filenames are generated from modality/model names. Fusion comparison plots include grouped score-level versus feature-level bars for each fingerprint–iris architecture pair. `pairing.json` records the deterministic synthetic pairing and prominently documents that the identities are synthetic.
 
-The fusion accuracy comparison is saved at `results/experiments/fusion/plots/comparisons/fusion_accuracy_comparison.png` and includes all fingerprint-model × iris-model combinations, with separate score-level and feature-level bars.
+## Reproducibility and limitations
 
-```text
-results/experiments/fusion/
-├── metrics.json
-├── metrics.csv
-├── fusion_delta.json
-├── fusion_delta.csv
-├── pairing.json
-├── bootstrap_intervals.json
-├── scores/
-└── plots/
-    ├── det/
-    ├── distributions/
-    ├── far_frr/
-    ├── pca/
-    ├── roc/
-    └── comparisons/
-        ├── fusion_accuracy_comparison.png
-        ├── fusion_eer_improvement.png
-        └── fusion_auc_improvement.png
-```
+- Subject splits are persisted in `results/subject_split.json`; the loader validates the saved split before using it.
+- The default seed is `37`. Keep the split manifest and configuration with reported results.
+- Fusion pairs independent fingerprint and iris evaluation subjects. It is not genuine paired multimodal evaluation.
+- Cartesian products reuse the same modality query samples in multiple trials. Trial scores are therefore not all statistically independent; avoid interpreting raw trial count as an independent-sample count.
+- Enrollment/verification granularity changes the authentication unit and can change the results substantially. Compare systems only after stating their protocol settings.
+- The local data, pretrained weights, checkpoints, and experiment outputs are not included in this source archive.
 
-The notebooks are presentation layers over these experiment artifacts.
+## Further documentation
 
-## Reproducibility
-
-The subject split and experiment pairing are deterministic under the configured seed. The headline fusion experiment uses `EXPERIMENT_PAIRS` independently held-out fingerprint/iris subject pairs, with a maximum controlled by `VIRTUAL_PAIRING_LIMIT`.
-
-## Local authentication UI
-
-The project includes a Flask/Jinja demonstration UI for running the trained embedding pipeline manually. It supports selecting a modality and trained model, enrolling a user by uploading one or more samples under a supplied subject ID, and then identifying or verifying uploaded samples. When a claimed subject ID is supplied, the UI reports the claimed score, strongest non-claimed score, the saved EER threshold for that model, and the resulting genuine/impostor decision. Enrollments are kept in memory only and are cleared when the process exits or with the **Clear all enrollments** action.
-
-Start it with:
-
-```bash
-python3 -m ui.app
-```
-
-Then open `http://127.0.0.1:5000/`. The UI uses the same deterministic evaluation preprocessing and trained checkpoints as the experiment pipeline.
-
-## Testing
-
-Run:
-
-```bash
-python3 -m unittest discover -s tests -v
-```
-
-The tests cover deterministic virtual pairing, trial construction, subject-level verification aggregation, configuration types, and metric reporting.
-
-## Important limitation
-
-The headline fusion experiment uses **synthetic virtual identities** because the available fingerprint and iris datasets have independent subject populations. The fusion results therefore demonstrate the behavior of the implemented multimodal fusion protocol, but they should not be described as performance measured on genuinely paired fingerprint-and-iris samples from the same physical individuals.
+Read [`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md) for the detailed code architecture, tensor/data flow, training and inference behavior, standalone and fusion trial semantics, configuration reference, metrics, plot conventions, and output schemas.
